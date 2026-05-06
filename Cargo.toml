@@ -1,10 +1,11 @@
 [package]
 name = "perc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Scaffold, run, and deploy Rust web apps to your own VPS"
 license = "MIT"
 repository = "https://github.com/crabby-utils/perc"
+homepage = "https://perc.daz.is"
 readme = "README.md"
 keywords = ["deploy", "vps", "rust", "axum", "scaffold"]
 categories = ["command-line-utilities", "development-tools"]

@@ -2,7 +2,7 @@
 
 Scaffold, run, and deploy Rust web apps to your own VPS.
 
-> **Early preview.** Perc is in active development and has rough edges. APIs will change, features will break, and there are gaps in what's implemented. Don't rely on it for anything serious yet. See the [website](https://perc.rs) for more context.
+> **Early preview.** Perc is in active development and has rough edges. APIs will change, features will break, and there are gaps in what's implemented. Don't rely on it for anything serious yet. See the [website](https://perc.daz.is) for more context.
 
 ## Install
 
