@@ -243,6 +243,14 @@ pub async fn run_init(output: &Output, host: &str) -> color_eyre::Result<()> {
     )
     .await?;
 
+    let rebooted_session = reboot_if_required(output, &session, &connect_host).await?;
+    let session = if let Some(s) = rebooted_session {
+        drop(session);
+        s
+    } else {
+        session
+    };
+
     output.step("tailscale", "installing tailscale");
     ssh_run(
         &session,
@@ -255,7 +263,7 @@ pub async fn run_init(output: &Output, host: &str) -> color_eyre::Result<()> {
     ssh_run(
         &session,
         "tailscale up",
-        &format!("TS_AUTHKEY={authkey} tailscale up --ssh"),
+        &format!("export TS_AUTH_KEY={authkey} && tailscale up --ssh --auth-key=$TS_AUTH_KEY"),
     )
     .await?;
 
@@ -1697,7 +1705,7 @@ async fn ensure_postgresql(session: &Session) -> eyre::Result<()> {
         sudo_ssh_run(
             session,
             "install postgresql",
-            "env DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql",
+            "apt-get install -y postgresql",
         )
         .await?;
         sudo_ssh_run(session, "enable postgresql", "systemctl enable postgresql").await?;
@@ -2025,7 +2033,7 @@ async fn read_registry(session: &Session) -> eyre::Result<Registry> {
 }
 
 async fn migrate_from_quadlets(session: &Session) -> eyre::Result<Registry> {
-    let listing = sudo_ssh_run(
+    let listing = ssh_run(
         session,
         "scan quadlets",
         "ls /etc/containers/systemd/*.container 2>/dev/null || echo ''",
@@ -2043,7 +2051,7 @@ async fn migrate_from_quadlets(session: &Session) -> eyre::Result<Registry> {
         let Some(app_name) = filename.strip_suffix(".container") else {
             continue;
         };
-        let content = sudo_ssh_run(session, "read quadlet", &format!("cat {line}"))
+        let content = ssh_run(session, "read quadlet", &format!("cat {line}"))
             .await
             .unwrap_or_default();
         let port = parse_quadlet_port(&content).unwrap_or(BASE_PORT);
@@ -2123,6 +2131,46 @@ async fn release_deploy_lock(session: &Session) {
         &format!("rm -rf {LOCK_PATH}"),
     )
     .await;
+}
+
+async fn reboot_if_required(
+    output: &Output,
+    session: &Session,
+    connect_host: &str,
+) -> eyre::Result<Option<Session>> {
+    let needs_reboot = ssh_run(
+        session,
+        "check reboot required",
+        "test -f /var/run/reboot-required && echo yes || echo no",
+    )
+    .await?;
+
+    if needs_reboot.trim() != "yes" {
+        return Ok(None);
+    }
+
+    output.step("reboot", "rebooting to apply system updates");
+    ssh_run(session, "reboot", "reboot &").await.ok();
+
+    tokio::time::sleep(Duration::from_secs(15)).await;
+
+    for attempt in 1..=20 {
+        if let Ok(s) = SessionBuilder::default()
+            .known_hosts_check(KnownHosts::Add)
+            .connect_timeout(Duration::from_secs(10))
+            .connect(format!("root@{connect_host}"))
+            .await
+        {
+            return Ok(Some(s));
+        }
+        output.step(
+            "reboot",
+            &format!("waiting for VPS to come back (attempt {attempt}/20)"),
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+
+    eyre::bail!("VPS did not come back after reboot");
 }
 
 async fn ssh_run(session: &Session, description: &str, cmd: &str) -> eyre::Result<String> {
@@ -2219,10 +2267,32 @@ async fn sudo_ssh_write_file(
 }
 
 fn sudoers_content() -> &'static str {
-    "# perc deployment tool — least privilege sudoers policy\n\
-     perc ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/podman, \
-     /usr/bin/apt-get, /usr/bin/tee, /bin/mkdir, /bin/rm, /bin/mv, \
-     /bin/chmod, /usr/bin/curl, /usr/bin/gpg, /usr/bin/tar, /usr/sbin/ufw\n\
+    "# perc deployment tool — least-privilege sudoers policy\n\
+     Cmnd_Alias PERC_SYSTEMCTL = \\\n\
+     \x20   /usr/bin/systemctl daemon-reload, \\\n\
+     \x20   /usr/bin/systemctl stop *, \\\n\
+     \x20   /usr/bin/systemctl start *, \\\n\
+     \x20   /usr/bin/systemctl restart *, \\\n\
+     \x20   /usr/bin/systemctl reload *, \\\n\
+     \x20   /usr/bin/systemctl enable *\n\
+     Cmnd_Alias PERC_PODMAN = /usr/bin/podman load\n\
+     Cmnd_Alias PERC_APT = \\\n\
+     \x20   /usr/bin/apt-get update, \\\n\
+     \x20   /usr/bin/apt-get update *, \\\n\
+     \x20   /usr/bin/apt-get install *\n\
+     Cmnd_Alias PERC_TEE = \\\n\
+     \x20   /usr/bin/tee /etc/caddy/*, \\\n\
+     \x20   /usr/bin/tee /etc/containers/systemd/*, \\\n\
+     \x20   /usr/bin/tee /etc/systemd/system/*, \\\n\
+     \x20   /usr/bin/tee /etc/postgresql/*\n\
+     Cmnd_Alias PERC_MKDIR = \\\n\
+     \x20   /bin/mkdir -p /etc/caddy, \\\n\
+     \x20   /bin/mkdir -p /etc/containers/systemd, \\\n\
+     \x20   /bin/mkdir -p /var/lib/restate\n\
+     Cmnd_Alias PERC_RM = /bin/rm -f /etc/containers/systemd/*\n\
+     Cmnd_Alias PERC_MV = /bin/mv /tmp/restate /tmp/restate-server /usr/local/bin/\n\
+     Cmnd_Alias PERC_CHMOD = /bin/chmod +x /tmp/restate /tmp/restate-server\n\
+     perc ALL=(ALL) NOPASSWD: PERC_SYSTEMCTL, PERC_PODMAN, PERC_APT, PERC_TEE, PERC_MKDIR, PERC_RM, PERC_MV, PERC_CHMOD\n\
      perc ALL=(postgres) NOPASSWD: /usr/bin/psql\n"
 }
 
@@ -3008,17 +3078,45 @@ mod tests {
     }
 
     #[test]
-    fn sudoers_no_shell_interpreters() {
+    fn sudoers_least_privilege() {
         let content = sudoers_content();
         assert!(
             !content.contains("/bin/bash"),
             "sudoers must not allow bash"
         );
         assert!(!content.contains("/bin/sh"), "sudoers must not allow sh");
+        assert!(
+            !content.contains("curl"),
+            "curl removed — only used during init as root"
+        );
+        assert!(
+            !content.contains("gpg"),
+            "gpg removed — only used during init as root"
+        );
+        assert!(
+            !content.contains("/usr/bin/tar"),
+            "tar removed — only used as perc user without sudo"
+        );
+        assert!(
+            !content.contains("ufw"),
+            "ufw removed — only used during init as root"
+        );
         assert!(content.contains("NOPASSWD:"));
         assert!(content.contains("/usr/bin/systemctl"));
         assert!(content.contains("/usr/bin/podman"));
         assert!(content.contains("(postgres)"));
         assert!(content.contains("/usr/bin/psql"));
+        assert!(
+            content.contains("Cmnd_Alias"),
+            "should use Cmnd_Alias for grouping"
+        );
+        assert!(
+            content.contains("podman load"),
+            "podman must be restricted to load"
+        );
+        assert!(
+            content.contains("systemctl daemon-reload"),
+            "systemctl must have argument restrictions"
+        );
     }
 }
