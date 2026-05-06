@@ -1,6 +1,6 @@
 [package]
 name = "perc"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Scaffold, run, and deploy Rust web apps to your own VPS"
 license = "MIT"
