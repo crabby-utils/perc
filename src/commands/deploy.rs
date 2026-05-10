@@ -279,6 +279,9 @@ pub async fn run_init(output: &Output, host: &str) -> color_eyre::Result<()> {
     output.step("caddy", "installing caddy");
     install_caddy(&session).await?;
 
+    output.step("stats", "installing perc-stats monitoring");
+    install_perc_stats(&session).await?;
+
     output.step("lockdown", "securing SSH and configuring firewall");
     lockdown_ssh(&session).await?;
 
@@ -1172,6 +1175,23 @@ pub async fn run_logs(
     Ok(())
 }
 
+#[derive(Serialize)]
+struct MonitorResult {
+    url: String,
+}
+
+pub fn run_monitor(output: &Output, target: &str) -> color_eyre::Result<()> {
+    let project = read_project_config(output);
+    let host = resolve_target(output, target, &project.targets);
+    let url = format!("http://{host}:9880");
+
+    output.step("monitor", &format!("opening {url}"));
+    open::that(&url).wrap_err("failed to open browser")?;
+
+    output.success(&MonitorResult { url });
+    Ok(())
+}
+
 fn add_database_to_perc_toml() -> eyre::Result<()> {
     let path = Path::new("perc.toml");
     let contents = std::fs::read_to_string(path).wrap_err("failed to read perc.toml")?;
@@ -1641,6 +1661,60 @@ async fn install_caddy(session: &Session) -> eyre::Result<()> {
     .await?;
 
     ssh_run(session, "enable caddy", "systemctl enable caddy").await?;
+
+    Ok(())
+}
+
+async fn install_perc_stats(session: &Session) -> eyre::Result<()> {
+    ssh_run(
+        session,
+        "install perc-stats",
+        "curl -fsSL https://github.com/crabby-utils/perc-stats/releases/download/v0.1.0/perc-stats \
+         -o /tmp/perc-stats && \
+         curl -fsSL https://github.com/crabby-utils/perc-stats/releases/download/v0.1.0/perc-stats.sha256 \
+         -o /tmp/perc-stats.sha256 && \
+         cd /tmp && sha256sum -c /tmp/perc-stats.sha256 && \
+         chmod +x /tmp/perc-stats && \
+         mv /tmp/perc-stats /usr/local/bin/perc-stats && \
+         rm /tmp/perc-stats.sha256",
+    )
+    .await?;
+
+    ssh_run(
+        session,
+        "create perc-stats data dir",
+        "mkdir -p /var/lib/perc-stats",
+    )
+    .await?;
+
+    ssh_write_file(
+        session,
+        "write perc-stats service",
+        "/etc/systemd/system/perc-stats.service",
+        "[Unit]\n\
+         Description=perc-stats monitoring dashboard\n\
+         After=network.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart=/usr/local/bin/perc-stats\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         NoNewPrivileges=yes\n\
+         ProtectHome=yes\n\
+         ReadWritePaths=/var/lib/perc-stats\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+    )
+    .await?;
+
+    ssh_run(
+        session,
+        "enable perc-stats",
+        "systemctl daemon-reload && systemctl enable --now perc-stats",
+    )
+    .await?;
 
     Ok(())
 }
@@ -2369,6 +2443,7 @@ systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true",
         r"ufw default deny incoming && \
 ufw default allow outgoing && \
 ufw allow in on tailscale0 to any port 22 && \
+ufw allow in on tailscale0 to any port 9880 && \
 ufw allow 80/tcp && \
 ufw allow 443/tcp && \
 ufw --force enable",

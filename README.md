@@ -123,11 +123,12 @@ This connects to `<host>` as root over SSH, then:
 1. Updates system packages
 2. Installs Tailscale and joins your tailnet (requires auth key — see above)
 3. Installs Podman 5.0+
-4. Locks down SSH (password auth disabled, port 22 restricted to Tailscale interface)
-5. Configures UFW firewall (allows 80/443 for web traffic)
-6. Creates a dedicated `perc` deploy user with a scoped sudoers policy
-7. Verifies connectivity over Tailscale as the `perc` user
-8. Records the target in `perc.toml`
+4. Installs [perc-stats](https://github.com/crabby-utils/perc-stats) for VPS monitoring (accessible via Tailscale)
+5. Locks down SSH (password auth disabled, port 22 restricted to Tailscale interface)
+6. Configures UFW firewall (allows 80/443 for web traffic)
+7. Creates a dedicated `perc` deploy user with a scoped sudoers policy
+8. Verifies connectivity over Tailscale as the `perc` user
+9. Records the target in `perc.toml`
 
 After init, the host is only reachable via Tailscale. All subsequent commands connect as the `perc` user (not root), with sudo restricted to specific binaries only.
 
@@ -360,6 +361,18 @@ perc deploy logs -f
 ```
 
 Use `--target <name>` to view logs from a specific target. Press Ctrl+C to stop following.
+
+### Monitor
+
+Open the [perc-stats](https://github.com/crabby-utils/perc-stats) dashboard for a target:
+
+```
+perc deploy monitor
+```
+
+This opens the monitoring UI in your browser (accessible over Tailscale only). Shows live CPU, memory, disk, network, and per-container metrics.
+
+Use `--target <name>` to monitor a specific target.
 
 ### Remove an app
 

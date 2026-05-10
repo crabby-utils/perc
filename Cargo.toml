@@ -1,6 +1,6 @@
 [package]
 name = "perc"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Scaffold, run, and deploy Rust web apps to your own VPS"
 license = "MIT"
@@ -27,6 +27,7 @@ openssh = { version = "0.11", features = ["process-mux"] }
 sha2 = "0.11.0"
 tar = "0.4.45"
 notify = "8"
+open = "5"
 percent-encoding = "2"
 
 [dev-dependencies]

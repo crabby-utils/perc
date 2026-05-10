@@ -37,6 +37,7 @@ pub async fn dispatch(args: Args) -> color_eyre::Result<()> {
             DeployAction::Logs { lines, follow } => {
                 deploy::run_logs(&output, &args.target, lines, follow).await
             }
+            DeployAction::Monitor => deploy::run_monitor(&output, &args.target),
             DeployAction::Secret { action } => match action {
                 SecretAction::Set { vars } => {
                     deploy::run_secret_set(&output, &args.target, &vars, force).await

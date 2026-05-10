@@ -902,3 +902,56 @@ fn deploy_logs_json_no_perc_toml_exits_1_with_json() {
     let v: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
     assert_eq!(v["code"], "no_project");
 }
+
+// --- deploy monitor ---
+
+#[test]
+fn help_deploy_shows_monitor_subcommand() {
+    perc()
+        .args(["help", "deploy"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("monitor"))
+        .stdout(predicate::str::contains("monitoring dashboard"));
+}
+
+#[test]
+fn deploy_monitor_no_perc_toml_exits_1() {
+    let dir = tempfile::tempdir().unwrap();
+
+    perc()
+        .args(["deploy", "monitor"])
+        .current_dir(&dir)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("perc.toml not found"));
+}
+
+#[test]
+fn deploy_monitor_no_targets_exits_1() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("perc.toml"), "[app]\nname = \"myapp\"\n").unwrap();
+
+    perc()
+        .args(["deploy", "monitor"])
+        .current_dir(&dir)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no targets configured"));
+}
+
+#[test]
+fn deploy_monitor_json_no_perc_toml_exits_1_with_json() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = perc()
+        .args(["--json", "deploy", "monitor"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let v: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(v["code"], "no_project");
+}

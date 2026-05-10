@@ -123,6 +123,8 @@ pub enum DeployAction {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Open the perc-stats monitoring dashboard in a browser
+    Monitor,
     /// Manage secrets stored on the VPS (not in version control)
     Secret {
         #[command(subcommand)]
