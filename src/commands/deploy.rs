@@ -109,7 +109,7 @@ fn allocate_worker_port(registry: &Registry, app_name: &str, app_port: u16) -> u
     next_available_port(&used)
 }
 
-fn is_valid_app_name(name: &str) -> bool {
+pub(crate) fn is_valid_app_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
@@ -1247,6 +1247,16 @@ fn read_project_config(output: &Output) -> ProjectConfig {
             .and_then(toml_edit::Item::as_str)
             .filter(|s| !s.is_empty())
             .map_or_else(|| format!("{app_name}-worker"), String::from);
+        if !is_valid_app_name(&worker) {
+            output.error(
+                "config_invalid",
+                &format!(
+                    "{worker:?} is not a valid worker name \
+                     (use alphanumeric, hyphens, underscores; cannot start with a digit)"
+                ),
+            );
+            process::exit(1);
+        }
         RestateProjectConfig { worker }
     });
     let env: BTreeMap<String, String> = doc

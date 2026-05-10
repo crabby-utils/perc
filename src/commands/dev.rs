@@ -6,6 +6,7 @@ use std::time::Duration;
 use color_eyre::eyre::{self, WrapErr};
 use serde::Serialize;
 
+use crate::commands::deploy::is_valid_app_name;
 use crate::output::Output;
 
 const POSTGRES_PORT: u16 = 5432;
@@ -88,6 +89,16 @@ fn read_dev_config(output: &Output) -> DevConfig {
             .and_then(toml_edit::Item::as_str)
             .filter(|s| !s.is_empty())
             .map_or_else(|| format!("{app_name}-worker"), String::from);
+        if !is_valid_app_name(&worker) {
+            output.error(
+                "config_invalid",
+                &format!(
+                    "{worker:?} is not a valid worker name \
+                     (use alphanumeric, hyphens, underscores; cannot start with a digit)"
+                ),
+            );
+            process::exit(1);
+        }
         RestateDevConfig { worker }
     });
     let env = doc
