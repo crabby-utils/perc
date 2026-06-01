@@ -41,10 +41,34 @@ const REGISTRY_PATH: &str = "/var/lib/perc/apps.toml";
 const LOCK_PATH: &str = "/var/lib/perc/deploy.lock";
 const RESTATE_INGRESS_PORT: u16 = 9080;
 
+/// Markers delimiting the perc-managed block inside `pg_hba.conf`. Everything
+/// between them is owned by perc and rewritten on every remote-access change.
+const HBA_BEGIN: &str = "# >>> perc remote-access (managed by perc — do not edit) >>>";
+const HBA_END: &str = "# <<< perc remote-access (managed by perc — do not edit) <<<";
+
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 struct Registry {
     #[serde(default)]
     apps: BTreeMap<String, AppEntry>,
+    /// Remote (tailnet) login roles, keyed by role name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    remotes: BTreeMap<String, RemoteEntry>,
+}
+
+/// A dedicated login role granted access to a database from one or more
+/// tailnet clients. Managed by `perc deploy db remote-allow`/`remote-revoke`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct RemoteEntry {
+    /// Database (an existing perc app database) this role can connect to.
+    db: String,
+    /// Owner role of `db`; the remote role is granted membership for read-write.
+    owner: String,
+    /// Allowed client addresses in CIDR form (e.g. `100.99.232.19/32`).
+    clients: Vec<String>,
+    /// True when the role was granted read-only (SELECT) access.
+    readonly: bool,
+    /// Generated password for the role (stored only in the VPS registry).
+    password: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -471,7 +495,7 @@ pub async fn run_push(output: &Output, target: &str, force: bool) -> color_eyre:
     write_registry(&session, &registry).await?;
 
     output.step("verify", "waiting for app to be reachable");
-    verify_app(&session, port).await?;
+    verify_app(&session, port, &project.health_check_path).await?;
 
     if let (Some((worker_tag, _)), Some(restate)) = (&worker_image, &restate_entry) {
         let worker_name = format!("{app_name}-worker");
@@ -826,7 +850,7 @@ pub async fn run_db(output: &Output, target: &str, force: bool) -> color_eyre::R
     write_registry(&session, &registry).await?;
 
     output.step("verify", "waiting for app to be reachable");
-    verify_app(&session, port).await?;
+    verify_app(&session, port, &project.health_check_path).await?;
 
     if !project.database {
         if let Err(e) = add_database_to_perc_toml() {
@@ -850,6 +874,550 @@ pub async fn run_db(output: &Output, target: &str, force: bool) -> color_eyre::R
     });
 
     Ok(())
+}
+
+#[derive(Serialize)]
+struct RemoteAllowResult {
+    target: String,
+    role: String,
+    database: String,
+    clients: Vec<String>,
+    readonly: bool,
+    host: String,
+    database_url: String,
+    restarted: bool,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "orchestration applying the defense-in-depth layers in sequence"
+)]
+pub async fn run_remote_allow(
+    output: &Output,
+    target: &str,
+    client: &str,
+    db: Option<&str>,
+    role: Option<&str>,
+    readonly: bool,
+    force: bool,
+) -> color_eyre::Result<()> {
+    let project = read_project_config(output);
+    let app_name = &project.app_name;
+    let host = resolve_target(output, target, &project.targets);
+
+    output.step(
+        "connect",
+        &format!("connecting to {host} as root over Tailscale"),
+    );
+    let session = connect_root(&host).await?;
+
+    output.step("lock", "acquiring deploy lock");
+    if !try_acquire_deploy_lock(&session, force).await? {
+        output.error(
+            "deploy_locked",
+            "another deploy is already in progress on this server — try again later, or use --force to clear the lock",
+        );
+        process::exit(1);
+    }
+
+    output.step("registry", "reading app registry");
+    let mut registry = read_registry(&session).await?;
+
+    // Resolve the target database (default: current project's app database).
+    let db_name = match db {
+        Some(d) => d.to_string(),
+        None => match registry.apps.get(app_name).and_then(|a| a.db.as_ref()) {
+            Some(creds) => creds.name.clone(),
+            None => {
+                release_and_exit(
+                    output,
+                    &session,
+                    "no_database",
+                    &format!(
+                        "{app_name} has no provisioned database — pass --db <name> or run `perc deploy db` first"
+                    ),
+                )
+                .await
+            }
+        },
+    };
+
+    // The owner role of that database (an existing perc app role).
+    let Some(owner) = registry
+        .apps
+        .values()
+        .filter_map(|a| a.db.as_ref())
+        .find(|c| c.name == db_name)
+        .map(|c| c.user.clone())
+    else {
+        release_and_exit(
+            output,
+            &session,
+            "unknown_database",
+            &format!(
+                "no perc-provisioned database named {db_name:?} on this target — see `perc deploy status`"
+            ),
+        )
+        .await
+    };
+
+    let role_name = match role {
+        Some(r) if is_valid_app_name(r) => pg_identifier(r),
+        Some(r) => {
+            release_and_exit(
+                output,
+                &session,
+                "invalid_role",
+                &format!("{r:?} is not a valid role name (alphanumeric, hyphens, underscores)"),
+            )
+            .await
+        }
+        None => default_remote_role(&db_name),
+    };
+
+    // Resolve the client to a CIDR, accepting an IP/CIDR literal or device name.
+    let cidr = if let Some(c) = normalize_client_cidr(client) {
+        c
+    } else {
+        output.step("tailscale", &format!("resolving device name {client:?}"));
+        let status = ssh_run(&session, "tailscale status", "tailscale status --json").await?;
+        if let Some(c) = parse_peer_ip(&status, client) {
+            c
+        } else {
+            release_and_exit(
+                output,
+                &session,
+                "unknown_client",
+                &format!(
+                    "could not resolve {client:?} to a tailnet IPv4 — pass an explicit IP/CIDR (e.g. 100.99.232.19)"
+                ),
+            )
+            .await
+        }
+    };
+
+    let paths = pg_paths(&session).await?;
+
+    // Layer 0: dedicated login role with a generated password (reused on re-run).
+    let password = match registry.remotes.get(&role_name) {
+        Some(r) => r.password.clone(),
+        None => ssh_run(&session, "generate password", "openssl rand -hex 32")
+            .await?
+            .trim()
+            .to_string(),
+    };
+    output.step("role", &format!("ensuring remote role {role_name}"));
+    ensure_remote_role(&session, &role_name, &password).await?;
+
+    output.step(
+        "grant",
+        &format!(
+            "granting {} access to {db_name}",
+            if readonly { "read-only" } else { "read-write" }
+        ),
+    );
+    if readonly {
+        grant_readonly(&session, &db_name, &role_name, &owner).await?;
+    } else {
+        grant_readwrite(&session, &role_name, &owner).await?;
+    }
+
+    // Layer 1: bind PostgreSQL to localhost + the host's Tailscale IP.
+    let ts_ip = ssh_run(&session, "tailscale ip", "tailscale ip -4").await?;
+    let ts_ip = ts_ip.lines().next().unwrap_or("").trim().to_string();
+    if ts_ip.parse::<std::net::Ipv4Addr>().is_err() {
+        release_and_exit(
+            output,
+            &session,
+            "no_tailscale_ip",
+            "could not determine the host's Tailscale IPv4 address",
+        )
+        .await;
+    }
+    let desired_listen = listen_addresses_conf(&ts_ip);
+    let current_listen = ssh_run(
+        &session,
+        "read listen conf",
+        &format!("cat {} 2>/dev/null || true", paths.listen_conf),
+    )
+    .await?;
+    let restarted = current_listen.trim() != desired_listen.trim();
+    if restarted {
+        output.step(
+            "listen",
+            &format!("binding PostgreSQL to localhost + {ts_ip}"),
+        );
+        ssh_write_file(
+            &session,
+            "write listen conf",
+            &paths.listen_conf,
+            &desired_listen,
+        )
+        .await?;
+    }
+
+    // Layer 4 (ordering): systemd drop-in so PostgreSQL waits for tailscaled.
+    let dropin_dir = format!("/etc/systemd/system/{}.service.d", paths.service);
+    let dropin_path = format!("{dropin_dir}/perc-tailnet.conf");
+    let current_dropin = ssh_run(
+        &session,
+        "read drop-in",
+        &format!("cat {dropin_path} 2>/dev/null || true"),
+    )
+    .await?;
+    if current_dropin.trim() != pg_startup_dropin().trim() {
+        output.step(
+            "ordering",
+            "adding systemd drop-in (PostgreSQL waits for tailscaled)",
+        );
+        ssh_run(
+            &session,
+            "mkdir drop-in dir",
+            &format!("mkdir -p {dropin_dir}"),
+        )
+        .await?;
+        ssh_write_file(&session, "write drop-in", &dropin_path, pg_startup_dropin()).await?;
+        ssh_run(&session, "daemon-reload", "systemctl daemon-reload").await?;
+    }
+
+    // Record the grant in the registry before rendering pg_hba from it.
+    {
+        let entry = registry
+            .remotes
+            .entry(role_name.clone())
+            .or_insert_with(|| RemoteEntry {
+                db: db_name.clone(),
+                owner: owner.clone(),
+                clients: Vec::new(),
+                readonly,
+                password: password.clone(),
+            });
+        db_name.clone_into(&mut entry.db);
+        owner.clone_into(&mut entry.owner);
+        entry.readonly = readonly;
+        password.clone_into(&mut entry.password);
+        if !entry.clients.contains(&cidr) {
+            entry.clients.push(cidr.clone());
+            entry.clients.sort();
+        }
+    }
+    let clients = registry.remotes[&role_name].clients.clone();
+
+    // Layer 2: pg_hba rule for the client /32 with scram-sha-256.
+    output.step(
+        "pg_hba",
+        &format!("allowing {cidr} → {db_name} (scram-sha-256)"),
+    );
+    let hba = ssh_run(&session, "read pg_hba", &format!("cat {}", paths.hba_file)).await?;
+    let new_hba = upsert_hba_block(&hba, &render_remote_hba(&registry.remotes));
+    if new_hba != hba {
+        ssh_run(
+            &session,
+            "backup pg_hba",
+            &format!("cp {f} {f}.perc-bak", f = paths.hba_file),
+        )
+        .await?;
+        ssh_write_file(&session, "write pg_hba", &paths.hba_file, &new_hba).await?;
+    }
+
+    // Layer 3: firewall — 5432 only on tailscale0, only from this /32.
+    output.step(
+        "firewall",
+        &format!("allowing {cidr} to 5432 on tailscale0"),
+    );
+    ssh_run(&session, "ufw allow", &ufw_allow_cmd(&cidr)).await?;
+
+    if restarted {
+        output.step(
+            "postgres",
+            "restarting PostgreSQL (one-time; brief drop, apps reconnect automatically)",
+        );
+        ssh_run(
+            &session,
+            "restart postgres",
+            &format!("systemctl restart {}", paths.service),
+        )
+        .await?;
+    } else {
+        ssh_run(&session, "reload postgres", "systemctl reload postgresql").await?;
+    }
+    ssh_run(&session, "verify postgres", "pg_isready").await?;
+
+    if restarted {
+        for (name, app) in &registry.apps {
+            if app.db.is_some() {
+                let active = ssh_run(
+                    &session,
+                    "check app",
+                    &format!("systemctl is-active {name} 2>/dev/null || true"),
+                )
+                .await
+                .unwrap_or_default();
+                if active.trim() != "active" {
+                    output.step(
+                        "warning",
+                        &format!("app {name} is not active after restart ({})", active.trim()),
+                    );
+                }
+            }
+        }
+    }
+
+    write_registry(&session, &registry).await?;
+    // Restore registry ownership (we wrote it as root, not the perc user).
+    ssh_run(
+        &session,
+        "fix registry owner",
+        &format!("chown perc:perc {REGISTRY_PATH}"),
+    )
+    .await
+    .ok();
+
+    release_deploy_lock(&session).await;
+    let _ = session.close().await;
+
+    let database_url = remote_database_url(&role_name, &password, &host, &db_name);
+    output.success(&RemoteAllowResult {
+        target: target.to_string(),
+        role: role_name,
+        database: db_name,
+        clients,
+        readonly,
+        host,
+        database_url,
+        restarted,
+    });
+
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct RemoteRevokeResult {
+    target: String,
+    role: String,
+    database: String,
+    removed_clients: Vec<String>,
+}
+
+pub async fn run_remote_revoke(
+    output: &Output,
+    target: &str,
+    role: &str,
+    force: bool,
+) -> color_eyre::Result<()> {
+    let project = read_project_config(output);
+    let host = resolve_target(output, target, &project.targets);
+
+    output.step(
+        "connect",
+        &format!("connecting to {host} as root over Tailscale"),
+    );
+    let session = connect_root(&host).await?;
+
+    output.step("lock", "acquiring deploy lock");
+    if !try_acquire_deploy_lock(&session, force).await? {
+        output.error(
+            "deploy_locked",
+            "another deploy is already in progress on this server — try again later, or use --force to clear the lock",
+        );
+        process::exit(1);
+    }
+
+    let mut registry = read_registry(&session).await?;
+    let role_name = pg_identifier(role);
+    let Some(entry) = registry.remotes.remove(&role_name) else {
+        release_and_exit(
+            output,
+            &session,
+            "unknown_remote",
+            &format!("no remote role named {role_name:?} — see `perc deploy db remote-list`"),
+        )
+        .await
+    };
+
+    let paths = pg_paths(&session).await?;
+
+    output.step("role", &format!("dropping remote role {role_name}"));
+    ssh_run(
+        &session,
+        "drop owned",
+        &format!(
+            "sudo -u postgres psql -d \"{db}\" -c \"DROP OWNED BY \\\"{role_name}\\\"\"",
+            db = entry.db
+        ),
+    )
+    .await
+    .ok();
+    ssh_run(
+        &session,
+        "drop role",
+        &format!("sudo -u postgres psql -c \"DROP ROLE IF EXISTS \\\"{role_name}\\\"\""),
+    )
+    .await?;
+
+    output.step("pg_hba", &format!("removing pg_hba rules for {role_name}"));
+    let hba = ssh_run(&session, "read pg_hba", &format!("cat {}", paths.hba_file)).await?;
+    let new_hba = upsert_hba_block(&hba, &render_remote_hba(&registry.remotes));
+    if new_hba != hba {
+        ssh_run(
+            &session,
+            "backup pg_hba",
+            &format!("cp {f} {f}.perc-bak", f = paths.hba_file),
+        )
+        .await?;
+        ssh_write_file(&session, "write pg_hba", &paths.hba_file, &new_hba).await?;
+    }
+
+    // Delete firewall rules for client IPs no longer referenced by any remote.
+    let still_used: std::collections::HashSet<&String> =
+        registry.remotes.values().flat_map(|r| &r.clients).collect();
+    let mut removed_clients = Vec::new();
+    for cidr in &entry.clients {
+        if !still_used.contains(cidr) {
+            output.step("firewall", &format!("closing 5432 for {cidr}"));
+            ssh_run(&session, "ufw delete", &ufw_delete_cmd(cidr))
+                .await
+                .ok();
+            removed_clients.push(cidr.clone());
+        }
+    }
+
+    ssh_run(&session, "reload postgres", "systemctl reload postgresql").await?;
+
+    write_registry(&session, &registry).await?;
+    ssh_run(
+        &session,
+        "fix registry owner",
+        &format!("chown perc:perc {REGISTRY_PATH}"),
+    )
+    .await
+    .ok();
+
+    release_deploy_lock(&session).await;
+    let _ = session.close().await;
+
+    output.success(&RemoteRevokeResult {
+        target: target.to_string(),
+        role: role_name,
+        database: entry.db,
+        removed_clients,
+    });
+
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct RemoteInfo {
+    role: String,
+    database: String,
+    clients: Vec<String>,
+    readonly: bool,
+}
+
+#[derive(Serialize)]
+struct RemoteListResult {
+    target: String,
+    host: String,
+    remotes: Vec<RemoteInfo>,
+}
+
+pub async fn run_remote_list(output: &Output, target: &str) -> color_eyre::Result<()> {
+    let project = read_project_config(output);
+    let host = resolve_target(output, target, &project.targets);
+
+    output.step(
+        "connect",
+        &format!("connecting to {host} as root over Tailscale"),
+    );
+    let session = connect_root(&host).await?;
+    let registry = read_registry(&session).await?;
+    let _ = session.close().await;
+
+    let remotes = registry
+        .remotes
+        .into_iter()
+        .map(|(role, e)| RemoteInfo {
+            role,
+            database: e.db,
+            clients: e.clients,
+            readonly: e.readonly,
+        })
+        .collect();
+
+    output.success(&RemoteListResult {
+        target: target.to_string(),
+        host,
+        remotes,
+    });
+
+    Ok(())
+}
+
+async fn ensure_remote_role(session: &Session, role: &str, password: &str) -> eyre::Result<()> {
+    ssh_run(
+        session,
+        "create remote role",
+        &format!(
+            "sudo -u postgres psql -tc \"SELECT 1 FROM pg_roles WHERE rolname = '{role}'\" \
+             | grep -q 1 || \
+             sudo -u postgres psql -c \"CREATE ROLE \\\"{role}\\\" LOGIN PASSWORD '{password}'\""
+        ),
+    )
+    .await?;
+    ssh_run(
+        session,
+        "set remote role password",
+        &format!("sudo -u postgres psql -c \"ALTER ROLE \\\"{role}\\\" WITH LOGIN PASSWORD '{password}'\""),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn grant_readwrite(session: &Session, role: &str, owner: &str) -> eyre::Result<()> {
+    ssh_run(
+        session,
+        "grant read-write",
+        &format!("sudo -u postgres psql -c \"GRANT \\\"{owner}\\\" TO \\\"{role}\\\"\""),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn grant_readonly(session: &Session, db: &str, role: &str, owner: &str) -> eyre::Result<()> {
+    let sql = format!(
+        "GRANT CONNECT ON DATABASE \\\"{db}\\\" TO \\\"{role}\\\"; \
+         GRANT USAGE ON SCHEMA public TO \\\"{role}\\\"; \
+         GRANT SELECT ON ALL TABLES IN SCHEMA public TO \\\"{role}\\\"; \
+         ALTER DEFAULT PRIVILEGES FOR ROLE \\\"{owner}\\\" IN SCHEMA public \
+         GRANT SELECT ON TABLES TO \\\"{role}\\\""
+    );
+    ssh_run(
+        session,
+        "grant read-only",
+        &format!("sudo -u postgres psql -d \"{db}\" -c \"{sql}\""),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn pg_paths(session: &Session) -> eyre::Result<PgPaths> {
+    let conf_dir = ssh_run(
+        session,
+        "find pg conf.d",
+        "find /etc/postgresql -name conf.d -type d | head -1",
+    )
+    .await?;
+    parse_pg_paths(&conf_dir).ok_or_else(|| {
+        eyre::eyre!("could not locate the PostgreSQL config directory under /etc/postgresql")
+    })
+}
+
+/// Release the deploy lock, report a user error, and exit 1. The SSH connection
+/// is torn down by the OS on exit (we only hold a borrow here).
+async fn release_and_exit(output: &Output, session: &Session, code: &str, message: &str) -> ! {
+    release_deploy_lock(session).await;
+    output.error(code, message);
+    process::exit(1);
 }
 
 #[derive(Serialize)]
@@ -961,7 +1529,7 @@ pub async fn run_secret_set(
     }
 
     output.step("verify", "waiting for app to be reachable");
-    verify_app(&session, port).await?;
+    verify_app(&session, port, &project.health_check_path).await?;
 
     release_deploy_lock(&session).await;
     let _ = session.close().await;
@@ -1057,7 +1625,7 @@ pub async fn run_secret_unset(
     }
 
     output.step("verify", "waiting for app to be reachable");
-    verify_app(&session, port).await?;
+    verify_app(&session, port, &project.health_check_path).await?;
 
     release_deploy_lock(&session).await;
     let _ = session.close().await;
@@ -1215,6 +1783,7 @@ struct ProjectConfig {
     restate: Option<RestateProjectConfig>,
     env: BTreeMap<String, String>,
     include: Vec<String>,
+    health_check_path: String,
 }
 
 fn read_project_config(output: &Output) -> ProjectConfig {
@@ -1279,6 +1848,32 @@ fn read_project_config(output: &Output) -> ProjectConfig {
         }
         RestateProjectConfig { worker }
     });
+    let env = read_env_table(&doc, output);
+    let include = doc
+        .get("app")
+        .and_then(|a| a.get("include"))
+        .and_then(toml_edit::Item::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let health_check_path = read_health_check_path(&doc, output);
+    ProjectConfig {
+        app_name,
+        targets: doc,
+        database,
+        restate,
+        env,
+        include,
+        health_check_path,
+    }
+}
+
+/// Non-secret environment variables from the `[env]` table, with each key
+/// validated as a legal environment variable name.
+fn read_env_table(doc: &toml_edit::DocumentMut, output: &Output) -> BTreeMap<String, String> {
     let env: BTreeMap<String, String> = doc
         .get("env")
         .and_then(toml_edit::Item::as_table)
@@ -1300,24 +1895,25 @@ fn read_project_config(output: &Output) -> ProjectConfig {
             process::exit(1);
         }
     }
-    let include = doc
+    env
+}
+
+/// The path the post-deploy reachability probe hits, from `[app].health_check`
+/// (default `/`). Must be absolute; a relative value is a config error.
+fn read_health_check_path(doc: &toml_edit::DocumentMut, output: &Output) -> String {
+    let path = doc
         .get("app")
-        .and_then(|a| a.get("include"))
-        .and_then(toml_edit::Item::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    ProjectConfig {
-        app_name,
-        targets: doc,
-        database,
-        restate,
-        env,
-        include,
+        .and_then(|a| a.get("health_check"))
+        .and_then(toml_edit::Item::as_str)
+        .map_or_else(|| "/".to_string(), str::to_string);
+    if !path.starts_with('/') {
+        output.error(
+            "config_invalid",
+            &format!("app.health_check must be an absolute path starting with '/' (got {path:?})"),
+        );
+        process::exit(1);
     }
+    path
 }
 
 fn resolve_target(output: &Output, target: &str, doc: &toml_edit::DocumentMut) -> String {
@@ -1782,6 +2378,163 @@ fn pg_tune_conf(total_ram_kb: u64) -> String {
     )
 }
 
+/// `PostgreSQL` filesystem and service names derived from a cluster's `conf.d`
+/// directory (Debian/Ubuntu layout, e.g. `/etc/postgresql/16/main/conf.d`).
+#[derive(Debug, PartialEq, Eq)]
+struct PgPaths {
+    main_dir: String,
+    hba_file: String,
+    listen_conf: String,
+    service: String,
+}
+
+fn parse_pg_paths(conf_d_dir: &str) -> Option<PgPaths> {
+    let main_dir = conf_d_dir.trim().strip_suffix("/conf.d")?;
+    let mut parts = main_dir.rsplit('/');
+    let cluster = parts.next().filter(|s| !s.is_empty())?;
+    let version = parts.next().filter(|s| !s.is_empty())?;
+    Some(PgPaths {
+        hba_file: format!("{main_dir}/pg_hba.conf"),
+        listen_conf: format!("{main_dir}/conf.d/perc-remote.conf"),
+        service: format!("postgresql@{version}-{cluster}"),
+        main_dir: main_dir.to_string(),
+    })
+}
+
+/// `conf.d` drop-in binding `PostgreSQL` to localhost plus the host's Tailscale
+/// IP. Kept separate from `perc-tune.conf` so neither file overwrites the other.
+fn listen_addresses_conf(tailscale_ip: &str) -> String {
+    format!(
+        "# Managed by perc — remote tailnet access (do not edit)\n\
+         listen_addresses = 'localhost,{tailscale_ip}'\n"
+    )
+}
+
+/// systemd drop-in making `PostgreSQL` order after tailscaled and the network so
+/// binding to the Tailscale IP can't lose a boot race.
+fn pg_startup_dropin() -> &'static str {
+    "# Managed by perc — wait for the Tailscale interface before binding\n\
+     [Unit]\n\
+     After=tailscaled.service network-online.target\n\
+     Wants=network-online.target\n"
+}
+
+/// Render the perc-managed `pg_hba.conf` rules for every remote role, wrapped in
+/// the delimiting markers. Returns an empty string when there are no remotes.
+fn render_remote_hba(remotes: &BTreeMap<String, RemoteEntry>) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for (role, entry) in remotes {
+        for client in &entry.clients {
+            lines.push(format!(
+                "host    {db}    {role}    {client}    scram-sha-256",
+                db = entry.db
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    lines.sort();
+    format!("{HBA_BEGIN}\n{}\n{HBA_END}\n", lines.join("\n"))
+}
+
+/// Remove an existing perc-managed block (between markers, inclusive), tidying
+/// surrounding newlines.
+fn strip_hba_block(existing: &str) -> String {
+    let Some(start) = existing.find(HBA_BEGIN) else {
+        return existing.to_string();
+    };
+    let before = existing[..start].trim_end_matches('\n');
+    let rest = &existing[start..];
+    let after = match rest.find(HBA_END) {
+        Some(end_rel) => rest[end_rel + HBA_END.len()..].trim_start_matches('\n'),
+        None => "",
+    };
+    match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => after.to_string(),
+        (false, true) => format!("{before}\n"),
+        (false, false) => format!("{before}\n{after}"),
+    }
+}
+
+/// Replace (or append) the perc-managed block in a `pg_hba.conf`. An empty
+/// `block` removes the managed section entirely.
+fn upsert_hba_block(existing: &str, block: &str) -> String {
+    let stripped = strip_hba_block(existing);
+    if block.is_empty() {
+        stripped
+    } else if stripped.is_empty() {
+        block.to_string()
+    } else if stripped.ends_with('\n') {
+        format!("{stripped}{block}")
+    } else {
+        format!("{stripped}\n{block}")
+    }
+}
+
+fn remote_database_url(role: &str, password: &str, host: &str, db: &str) -> String {
+    // `role` and `db` are validated pg identifiers (`[a-z0-9_]`, all URL-safe);
+    // only the password can contain characters that need percent-encoding.
+    let password = utf8_percent_encode(password, NON_ALPHANUMERIC);
+    format!("postgresql://{role}:{password}@{host}:5432/{db}")
+}
+
+fn ufw_allow_cmd(cidr: &str) -> String {
+    format!("ufw allow in on tailscale0 from {cidr} to any port 5432 proto tcp")
+}
+
+fn ufw_delete_cmd(cidr: &str) -> String {
+    format!("ufw delete allow in on tailscale0 from {cidr} to any port 5432 proto tcp")
+}
+
+/// Normalize a user-supplied client address to CIDR form. Returns `None` when
+/// the input is not an IP/CIDR literal (then it is resolved as a device name).
+fn normalize_client_cidr(input: &str) -> Option<String> {
+    let input = input.trim();
+    if let Some((addr, prefix)) = input.split_once('/') {
+        let ip: std::net::IpAddr = addr.parse().ok()?;
+        let bits: u8 = prefix.parse().ok()?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        (bits <= max).then(|| format!("{ip}/{bits}"))
+    } else {
+        let ip: std::net::IpAddr = input.parse().ok()?;
+        let bits = if ip.is_ipv4() { 32 } else { 128 };
+        Some(format!("{ip}/{bits}"))
+    }
+}
+
+/// Resolve a tailnet device name to its IPv4 `/32` from `tailscale status --json`.
+fn parse_peer_ip(json: &str, name: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let peers = v.get("Peer")?.as_object()?;
+    for peer in peers.values() {
+        let host = peer.get("HostName").and_then(serde_json::Value::as_str);
+        let short_dns = peer
+            .get("DNSName")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|d| d.split('.').next());
+        let matches = host.is_some_and(|h| h.eq_ignore_ascii_case(name))
+            || short_dns.is_some_and(|d| d.eq_ignore_ascii_case(name));
+        if !matches {
+            continue;
+        }
+        for ip in peer.get("TailscaleIPs")?.as_array()? {
+            if let Some(s) = ip.as_str()
+                && s.parse::<std::net::Ipv4Addr>().is_ok()
+            {
+                return Some(format!("{s}/32"));
+            }
+        }
+    }
+    None
+}
+
+/// Derive the default remote role name for a database.
+fn default_remote_role(db: &str) -> String {
+    format!("{}_remote", pg_identifier(db))
+}
+
 async fn ensure_postgresql(session: &Session) -> eyre::Result<()> {
     let has_psql = ssh_run(session, "check psql", "command -v psql").await;
     if has_psql.is_err() {
@@ -2073,7 +2826,12 @@ async fn install_app_container(
     Ok(())
 }
 
-async fn verify_app(session: &Session, port: u16) -> eyre::Result<()> {
+async fn verify_app(session: &Session, port: u16, path: &str) -> eyre::Result<()> {
+    // "Reachable" means curl got an HTTP response it didn't consider a failure
+    // (-f fails only on status >= 400). We deliberately do NOT inspect the body:
+    // an auth-gated app legitimately answers `/` with a 3xx redirect or a 200
+    // with no body (a dedicated `/ready` probe), and both mean "alive". The
+    // `&& echo ok` turns curl's exit status into the non-empty marker we check.
     for i in 0..5 {
         if i > 0 {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -2081,7 +2839,7 @@ async fn verify_app(session: &Session, port: u16) -> eyre::Result<()> {
         let result = ssh_run(
             session,
             "health check",
-            &format!("curl -sf http://127.0.0.1:{port}/ || true"),
+            &format!("curl -sf -o /dev/null http://127.0.0.1:{port}{path} && echo ok || true"),
         )
         .await;
         if let Ok(body) = result
@@ -2090,7 +2848,7 @@ async fn verify_app(session: &Session, port: u16) -> eyre::Result<()> {
             return Ok(());
         }
     }
-    eyre::bail!("app did not respond on port {port} after 10 seconds");
+    eyre::bail!("app did not respond on {path} (port {port}) after 10 seconds");
 }
 
 async fn connect(host: &str) -> eyre::Result<Session> {
@@ -2100,6 +2858,21 @@ async fn connect(host: &str) -> eyre::Result<Session> {
         .connect(format!("perc@{host}"))
         .await
         .wrap_err_with(|| format!("failed to connect to {host}"))
+}
+
+async fn connect_root(host: &str) -> eyre::Result<Session> {
+    SessionBuilder::default()
+        .known_hosts_check(KnownHosts::Add)
+        .connect_timeout(Duration::from_secs(30))
+        .connect(format!("root@{host}"))
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "failed to connect as root to {host} over Tailscale SSH — \
+                 managing remote database access is a privileged operation that \
+                 needs root SSH (the same access `perc deploy init` uses)"
+            )
+        })
 }
 
 async fn read_registry(session: &Session) -> eyre::Result<Registry> {
@@ -2583,14 +3356,33 @@ mod tests {
                 (*name).to_string(),
                 AppEntry {
                     port: *port,
-                    domain: domain.map(|d| d.to_string()),
+                    domain: domain.map(str::to_string),
                     db: None,
                     env: BTreeMap::new(),
                     restate: None,
                 },
             );
         }
-        Registry { apps }
+        Registry {
+            apps,
+            remotes: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn health_check_path_defaults_to_root() {
+        let output = Output::new(true);
+        let doc: toml_edit::DocumentMut = "[app]\nname = \"x\"\n".parse().unwrap();
+        assert_eq!(read_health_check_path(&doc, &output), "/");
+    }
+
+    #[test]
+    fn health_check_path_reads_custom_value() {
+        let output = Output::new(true);
+        let doc: toml_edit::DocumentMut = "[app]\nname = \"x\"\nhealth_check = \"/ready\"\n"
+            .parse()
+            .unwrap();
+        assert_eq!(read_health_check_path(&doc, &output), "/ready");
     }
 
     #[test]
@@ -3203,5 +3995,197 @@ mod tests {
             content.contains("systemctl daemon-reload"),
             "systemctl must have argument restrictions"
         );
+    }
+
+    // --- remote tailnet access ---
+
+    #[test]
+    fn parse_pg_paths_debian_layout() {
+        let p = parse_pg_paths("/etc/postgresql/16/main/conf.d\n").unwrap();
+        assert_eq!(p.main_dir, "/etc/postgresql/16/main");
+        assert_eq!(p.hba_file, "/etc/postgresql/16/main/pg_hba.conf");
+        assert_eq!(
+            p.listen_conf,
+            "/etc/postgresql/16/main/conf.d/perc-remote.conf"
+        );
+        assert_eq!(p.service, "postgresql@16-main");
+    }
+
+    #[test]
+    fn parse_pg_paths_rejects_non_conf_d() {
+        assert!(parse_pg_paths("/etc/postgresql/16/main").is_none());
+        assert!(parse_pg_paths("/conf.d").is_none());
+    }
+
+    #[test]
+    fn listen_addresses_conf_binds_localhost_and_tailscale_ip() {
+        let conf = listen_addresses_conf("100.86.229.102");
+        assert!(conf.contains("listen_addresses = 'localhost,100.86.229.102'"));
+        // never the wildcard / all-interfaces forms
+        assert!(!conf.contains("0.0.0.0"));
+        assert!(!conf.contains('*'));
+    }
+
+    #[test]
+    fn pg_startup_dropin_orders_after_tailscaled() {
+        let d = pg_startup_dropin();
+        assert!(d.contains("After=tailscaled.service network-online.target"));
+        assert!(d.contains("Wants=network-online.target"));
+        assert!(d.contains("[Unit]"));
+    }
+
+    fn remote(db: &str, owner: &str, clients: &[&str], readonly: bool) -> RemoteEntry {
+        RemoteEntry {
+            db: db.to_string(),
+            owner: owner.to_string(),
+            clients: clients.iter().map(|c| (*c).to_string()).collect(),
+            readonly,
+            password: "deadbeef".to_string(),
+        }
+    }
+
+    #[test]
+    fn render_remote_hba_empty_is_blank() {
+        assert_eq!(render_remote_hba(&BTreeMap::new()), "");
+    }
+
+    #[test]
+    fn render_remote_hba_emits_scram_rules_sorted() {
+        let mut remotes = BTreeMap::new();
+        remotes.insert(
+            "second_remote".to_string(),
+            remote("second", "second", &["100.99.232.19/32"], false),
+        );
+        let block = render_remote_hba(&remotes);
+        assert!(block.starts_with(HBA_BEGIN));
+        assert!(block.trim_end().ends_with(HBA_END));
+        assert!(
+            block.contains("host    second    second_remote    100.99.232.19/32    scram-sha-256")
+        );
+    }
+
+    #[test]
+    fn upsert_hba_block_inserts_then_replaces_idempotently() {
+        let base = "local all postgres peer\nhost all all 127.0.0.1/32 scram-sha-256\n";
+        let mut remotes = BTreeMap::new();
+        remotes.insert(
+            "api_remote".to_string(),
+            remote("api", "api", &["100.0.0.1/32"], false),
+        );
+
+        let block = render_remote_hba(&remotes);
+        let once = upsert_hba_block(base, &block);
+        assert!(once.contains("100.0.0.1/32"));
+        assert!(once.starts_with(base.trim_end_matches('\n')));
+
+        // re-applying the same block is a no-op (no duplicate markers)
+        let twice = upsert_hba_block(&once, &block);
+        assert_eq!(once, twice);
+        assert_eq!(twice.matches(HBA_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn upsert_hba_block_empty_removes_managed_section() {
+        let base = "local all postgres peer\n";
+        let mut remotes = BTreeMap::new();
+        remotes.insert(
+            "api_remote".to_string(),
+            remote("api", "api", &["100.0.0.1/32"], false),
+        );
+        let with = upsert_hba_block(base, &render_remote_hba(&remotes));
+        assert!(with.contains(HBA_BEGIN));
+
+        let without = upsert_hba_block(&with, &render_remote_hba(&BTreeMap::new()));
+        assert!(!without.contains(HBA_BEGIN));
+        assert!(!without.contains(HBA_END));
+        assert!(without.contains("local all postgres peer"));
+    }
+
+    #[test]
+    fn remote_database_url_uses_magicdns_host_and_encodes() {
+        let url = remote_database_url(
+            "api_remote",
+            "p@ss/word",
+            "daz-base-01.tail670b36.ts.net",
+            "api",
+        );
+        assert!(url.starts_with("postgresql://api_remote:"));
+        assert!(url.contains("@daz-base-01.tail670b36.ts.net:5432/api"));
+        // special characters in the password are percent-encoded
+        assert!(url.contains("p%40ss%2Fword"));
+    }
+
+    #[test]
+    fn ufw_commands_scope_to_tailscale0_and_5432() {
+        let allow = ufw_allow_cmd("100.99.232.19/32");
+        assert_eq!(
+            allow,
+            "ufw allow in on tailscale0 from 100.99.232.19/32 to any port 5432 proto tcp"
+        );
+        let delete = ufw_delete_cmd("100.99.232.19/32");
+        assert!(delete.starts_with("ufw delete allow in on tailscale0 from"));
+        // never a blanket public open
+        assert!(!allow.contains("allow 5432"));
+    }
+
+    #[test]
+    fn normalize_client_cidr_variants() {
+        assert_eq!(
+            normalize_client_cidr("100.99.232.19"),
+            Some("100.99.232.19/32".to_string())
+        );
+        assert_eq!(
+            normalize_client_cidr(" 100.99.232.19/32 "),
+            Some("100.99.232.19/32".to_string())
+        );
+        assert_eq!(
+            normalize_client_cidr("100.64.0.0/10"),
+            Some("100.64.0.0/10".to_string())
+        );
+        assert_eq!(normalize_client_cidr("100.99.232.19/33"), None);
+        assert_eq!(normalize_client_cidr("my-laptop"), None);
+        assert_eq!(normalize_client_cidr("not-an-ip"), None);
+    }
+
+    #[test]
+    fn parse_peer_ip_resolves_device_name() {
+        let json = r#"{
+            "Peer": {
+                "key1": {
+                    "HostName": "darrens-macbook-pro-2",
+                    "DNSName": "darrens-macbook-pro-2.tail670b36.ts.net.",
+                    "TailscaleIPs": ["100.99.232.19", "fd7a:115c:a1e0::1"]
+                }
+            }
+        }"#;
+        assert_eq!(
+            parse_peer_ip(json, "darrens-macbook-pro-2"),
+            Some("100.99.232.19/32".to_string())
+        );
+        // matches on the short DNS label too, case-insensitively
+        assert_eq!(
+            parse_peer_ip(json, "DARRENS-MACBOOK-PRO-2"),
+            Some("100.99.232.19/32".to_string())
+        );
+        assert_eq!(parse_peer_ip(json, "unknown-host"), None);
+    }
+
+    #[test]
+    fn default_remote_role_appends_suffix() {
+        assert_eq!(default_remote_role("second"), "second_remote");
+        assert_eq!(default_remote_role("my-app"), "my_app_remote");
+    }
+
+    #[test]
+    fn registry_serde_roundtrip_with_remotes() {
+        let mut reg = registry_with(&[("api", 8081, Some("api.example.com"))]);
+        reg.remotes.insert(
+            "api_remote".to_string(),
+            remote("api", "api", &["100.99.232.19/32"], true),
+        );
+        let toml = toml_edit::ser::to_string(&reg).unwrap();
+        let back: Registry = toml_edit::de::from_str(&toml).unwrap();
+        assert_eq!(reg, back);
+        assert!(toml.contains("api_remote"));
     }
 }

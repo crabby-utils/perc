@@ -244,6 +244,42 @@ With this section present, `perc deploy push` ensures PostgreSQL is installed an
 
 Multiple apps on the same VPS share a single PostgreSQL instance but each gets its own database and user with a unique password.
 
+#### Remote access over Tailscale
+
+By default PostgreSQL listens only on `localhost` and is unreachable from outside the VPS — apps connect over the loopback interface. To let a tool on another tailnet machine (e.g. a CLI on your laptop) connect directly, grant it access with a dedicated remote role:
+
+```
+perc deploy db remote allow 100.99.232.19
+```
+
+`100.99.232.19` is the client's Tailscale IP (run `tailscale ip -4` on that machine); a tailnet device name also works. By default the role gets read-write access to the current project's database — pass `--db <name>` to target a different app's database, `--role <name>` to name the role, and `--readonly` for SELECT-only access.
+
+This applies defense in depth so no single misconfiguration exposes the database:
+
+1. Binds PostgreSQL to `localhost` **plus the host's Tailscale IP only** (never `0.0.0.0`), via a dedicated `conf.d` drop-in.
+2. Adds a `pg_hba.conf` rule allowing **only the client's `/32`** with `scram-sha-256`.
+3. Opens port 5432 **only on the `tailscale0` interface, only from that `/32`** — the public interface stays closed.
+4. Installs a systemd drop-in so PostgreSQL waits for `tailscaled` (`After=tailscaled.service network-online.target`), so binding to the Tailscale IP can't lose a boot race.
+
+The command prints a ready-to-use `DATABASE_URL` over Tailscale MagicDNS:
+
+```
+postgresql://<role>:<password>@<host>.<tailnet>.ts.net:5432/<db>
+```
+
+The first grant on a host requires a one-time PostgreSQL restart to pick up the new bind address (a brief connection drop; running apps reconnect automatically). Subsequent grants only reload.
+
+List or revoke grants:
+
+```
+perc deploy db remote list
+perc deploy db remote revoke <role>
+```
+
+Revoking drops the role, removes its `pg_hba` rule, and closes its firewall rule. These changes are recorded in the VPS registry and live in files perc's normal deploy flow never rewrites, so they persist across `perc deploy push`. Managing remote access connects to the VPS as `root` over Tailscale SSH (the same access `perc deploy init` uses), since it configures the firewall and PostgreSQL startup.
+
+> **Tailscale ACLs:** for an extra layer, you can also restrict `:5432` to specific devices in your tailnet policy file. perc does not manage the tailnet ACL (it lives in the Tailscale admin console), so this step is optional and manual.
+
 ### Restate (durable execution)
 
 Add Restate support for durable workflows by adding a `[restate]` section to `perc.toml`:
@@ -290,6 +326,25 @@ include = ["prompts", "static/config.json"]
 ```
 
 Each entry is copied into the container at the same relative path. Directories are included recursively. The binary runs with `/` as its working directory, so `prompts/expand-base.md` in your project becomes `/prompts/expand-base.md` in the container.
+
+### Health check
+
+After deploying, perc waits for the app to become reachable by curling it over
+the loopback interface on the VPS. It treats any HTTP response curl doesn't
+consider an error (status `< 400`, including redirects) as "alive".
+
+By default it probes `/`. If your app gates `/` behind auth — answering an
+anonymous request with a redirect or a 401 — that still counts as reachable. But
+to keep the intent explicit, expose a dedicated endpoint that returns `200` with
+no auth and point the probe at it:
+
+```toml
+[app]
+name = "myapp"
+health_check = "/ready"
+```
+
+The path must be absolute (start with `/`).
 
 ### Environment variables
 
@@ -396,6 +451,7 @@ Create a `perc.toml` in your project root:
 [app]
 name = "myapp"
 include = ["prompts", "static/config.json"]  # optional — files/dirs bundled into the container
+health_check = "/ready"  # optional — path the post-deploy probe hits (default "/")
 
 [env]  # optional — non-secret environment variables injected into the container
 S3_REGION = "us-east-1"

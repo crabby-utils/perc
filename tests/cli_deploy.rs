@@ -955,3 +955,92 @@ fn deploy_monitor_json_no_perc_toml_exits_1_with_json() {
     let v: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
     assert_eq!(v["code"], "no_project");
 }
+
+#[test]
+fn help_deploy_db_shows_remote_subcommand() {
+    perc()
+        .args(["help", "deploy", "db"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remote"));
+}
+
+#[test]
+fn help_deploy_db_remote_shows_actions() {
+    perc()
+        .args(["help", "deploy", "db", "remote"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("allow"))
+        .stdout(predicate::str::contains("revoke"))
+        .stdout(predicate::str::contains("list"));
+}
+
+#[test]
+fn help_deploy_db_remote_allow_shows_flags() {
+    perc()
+        .args(["help", "deploy", "db", "remote", "allow"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--db"))
+        .stdout(predicate::str::contains("--role"))
+        .stdout(predicate::str::contains("--readonly"))
+        .stdout(predicate::str::contains("CLIENT"));
+}
+
+#[test]
+fn deploy_db_remote_allow_no_client_exits_2() {
+    perc()
+        .args(["deploy", "db", "remote", "allow"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn deploy_db_remote_allow_no_perc_toml_exits_1() {
+    let dir = tempfile::tempdir().unwrap();
+
+    perc()
+        .args(["deploy", "db", "remote", "allow", "100.99.232.19"])
+        .current_dir(&dir)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("perc.toml not found"));
+}
+
+#[test]
+fn deploy_db_remote_allow_no_targets_exits_1() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("perc.toml"), "[app]\nname = \"myapp\"\n").unwrap();
+
+    perc()
+        .args(["deploy", "db", "remote", "allow", "100.99.232.19"])
+        .current_dir(&dir)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no targets configured"));
+}
+
+#[test]
+fn deploy_db_remote_revoke_no_role_exits_2() {
+    perc()
+        .args(["deploy", "db", "remote", "revoke"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn deploy_db_remote_list_no_project_exits_1_with_json() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = perc()
+        .args(["--json", "deploy", "db", "remote", "list"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let v: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(v["code"], "no_project");
+}

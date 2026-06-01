@@ -112,8 +112,11 @@ pub enum DeployAction {
         /// App name to remove (defaults to current project's app name)
         name: Option<String>,
     },
-    /// Provision a database for the app (migrations are your app's responsibility)
-    Db,
+    /// Provision a database for the app, or manage remote tailnet access to it
+    Db {
+        #[command(subcommand)]
+        action: Option<DbAction>,
+    },
     /// Show logs for the deployed app
     Logs {
         /// Number of lines to show
@@ -130,6 +133,45 @@ pub enum DeployAction {
         #[command(subcommand)]
         action: SecretAction,
     },
+}
+
+#[derive(Subcommand)]
+pub enum DbAction {
+    /// Manage remote (tailnet) access to this target's databases over Tailscale
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RemoteAction {
+    /// Allow a tailnet client to reach a database over Tailscale
+    ///
+    /// Creates a dedicated remote login role and applies defense-in-depth:
+    /// binds `PostgreSQL` to the host's Tailscale IP, restricts `pg_hba` to the
+    /// client's /32 with scram-sha-256, opens 5432 only on tailscale0 from that
+    /// /32, and adds a systemd ordering drop-in so `PostgreSQL` waits for tailscaled.
+    Allow {
+        /// Tailnet IP/CIDR (e.g. 100.99.232.19) or device name of the client to allow
+        client: String,
+        /// Database to grant access to (defaults to the current project's app database)
+        #[arg(long)]
+        db: Option<String>,
+        /// Name for the dedicated remote login role (defaults to <db>_remote)
+        #[arg(long)]
+        role: Option<String>,
+        /// Grant read-only (SELECT) access instead of the default read-write
+        #[arg(long)]
+        readonly: bool,
+    },
+    /// Revoke a remote role's tailnet access and drop the role
+    Revoke {
+        /// Remote role name to revoke (see `perc deploy db remote list`)
+        role: String,
+    },
+    /// List remote roles with tailnet access to databases on this target
+    List,
 }
 
 #[derive(Subcommand)]

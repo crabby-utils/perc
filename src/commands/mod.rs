@@ -5,7 +5,10 @@ mod env;
 mod new;
 mod status;
 
-use crate::cli::{Args, Command, ConfigAction, DeployAction, DevAction, EnvAction, SecretAction};
+use crate::cli::{
+    Args, Command, ConfigAction, DbAction, DeployAction, DevAction, EnvAction, RemoteAction,
+    SecretAction,
+};
 use crate::output::Output;
 
 pub async fn dispatch(args: Args) -> color_eyre::Result<()> {
@@ -33,7 +36,32 @@ pub async fn dispatch(args: Args) -> color_eyre::Result<()> {
             DeployAction::Remove { name } => {
                 deploy::run_remove(&output, &args.target, name.as_deref(), force).await
             }
-            DeployAction::Db => deploy::run_db(&output, &args.target, force).await,
+            DeployAction::Db { action } => match action {
+                None => deploy::run_db(&output, &args.target, force).await,
+                Some(DbAction::Remote { action }) => match action {
+                    RemoteAction::Allow {
+                        client,
+                        db,
+                        role,
+                        readonly,
+                    } => {
+                        deploy::run_remote_allow(
+                            &output,
+                            &args.target,
+                            &client,
+                            db.as_deref(),
+                            role.as_deref(),
+                            readonly,
+                            force,
+                        )
+                        .await
+                    }
+                    RemoteAction::Revoke { role } => {
+                        deploy::run_remote_revoke(&output, &args.target, &role, force).await
+                    }
+                    RemoteAction::List => deploy::run_remote_list(&output, &args.target).await,
+                },
+            },
             DeployAction::Logs { lines, follow } => {
                 deploy::run_logs(&output, &args.target, lines, follow).await
             }
