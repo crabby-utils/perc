@@ -1,6 +1,6 @@
 [package]
 name = "perc"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Scaffold, run, and deploy Rust web apps to your own VPS"
 license = "MIT"
@@ -29,6 +29,7 @@ tar = "0.4.45"
 notify = "8"
 open = "5"
 percent-encoding = "2"
+rlimit = "0.11"
 
 [dev-dependencies]
 assert_cmd = "2.2"
